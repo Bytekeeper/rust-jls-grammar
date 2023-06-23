@@ -1,4 +1,4 @@
-use heck::ToSnakeCase;
+use heck::{ToSnakeCase, ToUpperCamelCase};
 use nom::branch::*;
 use nom::bytes::complete::*;
 use nom::character::complete::*;
@@ -9,12 +9,25 @@ use nom::IResult;
 use scraper::{Html, Selector};
 use std::collections::HashMap;
 
+const box_list: &[&str] = &[
+    "UnaryExpression",
+    "MultiplicativeExpression",
+    "AdditiveExpression",
+    "ShiftExpression",
+    "EqualityExpression",
+    "TypeArgument",
+    "ClassOrInterfaceType",
+    "UnannClassOrInterfaceType",
+    "LambdaBody",
+    "RelationalExpression",
+];
+
 #[derive(Debug)]
 pub struct Rhs {
     one_of: Vec<Element>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Element {
     Multi(Vec<Element>),
     Optional(Vec<Element>),
@@ -24,10 +37,13 @@ pub enum Element {
 
 fn parse_rhs_opt(input: &str) -> IResult<&str, Element> {
     map(
-        delimited(
-            char('['),
-            separated_list1(multispace1, parse_rhs_element),
-            char(']'),
+        verify(
+            delimited(
+                char('['),
+                separated_list1(multispace1, parse_rhs_element),
+                char(']'),
+            ),
+            |v: &Vec<_>| !v.is_empty(),
         ),
         |v| Element::Optional(v),
     )(input)
@@ -138,9 +154,9 @@ fn main() -> anyhow::Result<()> {
             // );
             // eprintln!("{:?}", parse_rhs(&rhs).unwrap());
             // eprintln!("{lhs}");
-            if lhs == "FloatingPointType" {
-                eprintln!("{:#?}", rhs);
-            }
+            // if lhs == "FloatingPointType" {
+            //     eprintln!("{:#?}", rhs);
+            // }
             rules.insert(lhs, parse_rhs(&rhs).unwrap());
         }
     }
@@ -157,97 +173,263 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("pub struct Span {{}}");
+    println!("use nom::sequence::tuple;");
+    println!("use nom::multi::many0;");
+    println!("use nom::branch::alt;");
+    println!("use nom::combinator::opt;");
+    println!("use nom::IResult;");
+    println!("pub struct Span {{");
+    println!("}}");
     for (rule, production) in &rules {
         if production.one_of.len() == 1 {
-            println!("pub struct {rule} {{");
-            add_fields(&production.one_of[0]);
+            println!("pub struct {rule} ");
+            print_fields(&production.one_of[0], 0);
         } else {
             println!("pub enum {rule} {{");
-            for e in &production.one_of {
-                add_fields(e);
+            for (i, e) in production.one_of.iter().enumerate() {
+                if i > 0 {
+                    print!(",");
+                }
+                match e {
+                    Element::Sequence(elements)
+                        if matches!(elements.as_slice(), [Element::Terminal(_)]) =>
+                    {
+                        let [element@ Element::Terminal(term)] = elements.as_slice() else { panic!() };
+                        print!("    {}", term_name(term).to_upper_camel_case());
+                        println!("(");
+                        print_type(element);
+                        println!(")");
+                    }
+                    Element::Terminal(term) => {
+                        print!("    {}", term_name(term).to_upper_camel_case());
+                        println!("(");
+                        print_type(e);
+                        println!(")");
+                    }
+                    _ => {
+                        print!("    Variant{i} ");
+                        print_fields(e, i);
+                    }
+                }
             }
+            println!("}}");
         }
+    }
+    for (rule, production) in &rules {
+        println!(
+            "fn {}(input: &str) -> IResult<&str, {}> {{",
+            match rule.to_snake_case().as_str() {
+                "type" => "r#type",
+                x => x,
+            },
+            rule.to_upper_camel_case()
+        );
+        if production.one_of.len() == 1 {
+            nom_tuple(&[production.one_of[0].clone()]);
+        } else {
+            print!("alt((");
+            for (i, e) in production.one_of.iter().enumerate() {
+                if i > 0 {
+                    print!(", ");
+                }
+                nom_tuple(&[e.clone()]);
+            }
+            print!("))");
+        }
+        println!("(input)");
         println!("}}");
     }
     Ok(())
 }
 
-pub fn add_fields(p: &Element) {
-    match p {
-        Element::Multi(elements) => println!("    pub multi: Vec<({})>,", "missing"),
-        Element::Sequence(elements) => {
-            for e in elements {
-                add_fields(e);
+fn nom_tuple(element: &[Element]) {
+    assert!(element.len() > 0);
+    if element.len() > 1 {
+        print!("tuple(");
+    }
+    for e in element {
+        match e {
+            Element::Multi(elements) => {
+                print!("many0(");
+                nom_tuple(elements);
+                print!(")");
+            }
+            Element::Optional(elements) => {
+                print!("opt(");
+                nom_tuple(elements);
+                print!(")");
+            }
+            Element::Sequence(elements) => {
+                nom_tuple(elements);
+            }
+            Element::Terminal(terminal) => {
+                let name = term_name(terminal).to_snake_case();
+                assert!(!name.trim().is_empty());
+                print!("{name}");
             }
         }
-        Element::Optional(elements) => {
-            println!("    pub optional: Option<{}>,", "missing");
+        if element.len() > 1 {
+            print!(", ");
         }
-        Element::Terminal(terminal) if terminal.chars().next().unwrap().is_lowercase() => {
-            println!("    pub {}: Span,", terminal);
+    }
+    if element.len() > 1 {
+        print!(")");
+    }
+}
+
+pub fn print_type(p: &Element) {
+    match p {
+        Element::Optional(elements) | Element::Multi(elements) => {
+            if matches!(p, Element::Optional(_)) {
+                print!("Option<");
+            } else {
+                print!("Vec<");
+            }
+            if elements.len() > 1 {
+                print!("(");
+            }
+            let mut first = true;
+            for e in elements {
+                if !first {
+                    print!(", ");
+                }
+                first = false;
+                print_type(e);
+            }
+            if elements.len() > 1 {
+                print!(")");
+            }
+            print!(">");
         }
         Element::Terminal(terminal) if terminal.chars().next().unwrap().is_uppercase() => {
-            println!("    pub {}: {},", terminal.to_snake_case(), terminal);
+            if box_list.contains(&terminal.as_str()) {
+                print!("Box<{terminal}>");
+            } else {
+                print!("{terminal}");
+            }
+        }
+        Element::Terminal(terminal) => {
+            print!("Span");
+        }
+        Element::Sequence(elements) => {
+            println!("{{");
+            for (i, e) in elements.iter().enumerate() {
+                print_fields(e, i);
+            }
+            print!("}}");
+        }
+    }
+}
+
+fn term_name(terminal: &str) -> &str {
+    match terminal {
+        "{" => "left_curly_brace",
+        "}" => "right_curly_brace",
+        "[" => "left_bracket",
+        "]" => "right_bracket",
+        "(" => "left_brace",
+        ")" => "right_brace",
+        ";" => "semicolon",
+        "--" => "minus_minus",
+        "++" => "plus_plus",
+        "<<" => "shl",
+        ">>" => "shr",
+        "<<<" => "rol",
+        ">>>" => "ror",
+        "&" => "ampersand",
+        "<" => "less_than",
+        ">" => "greater_than",
+        ":" => "colon",
+        "=" => "equals_sign",
+        "==" => "equals",
+        "!=" => "not_equals",
+        "<=" => "lt_equals",
+        ">=" => "gt_equals",
+        "<<=" => "shl_assign",
+        ">>=" => "shr_assign",
+        ">>>=" => "ror_assign",
+        "<<<=" => "rol_assign",
+        "&=" => "and_assign",
+        "|=" => "or_assign",
+        "*=" => "mul_assign",
+        "/=" => "div_assign",
+        "-=" => "minus_assign",
+        "+=" => "plus_assign",
+        "%=" => "mod_assign",
+        "^=" => "neg_assign",
+        "::" => "colon_colon",
+        "!" => "not",
+        "|" => "pipe",
+        "%" => "sym_mod",
+        "/" => "slash",
+        "~" => "tilde",
+        "." => "dot",
+        "+" => "plus",
+        "-" => "minus",
+        "*" => "star",
+        "@" => "at",
+        "<>" => "diamond",
+        "^" => "caret",
+        "?" => "question_mark",
+        "->" => "arrow_right",
+        "&&" => "logical_and",
+        "||" => "logical_or",
+        "..." => "varargs",
+        "super" => "t_super",
+        "static" => "t_static",
+        "enum" => "t_enum",
+        "final" => "t_final",
+        "," => "comma",
+        _ => terminal,
+    }
+}
+
+pub fn field_name_for(e: &Element) -> Option<String> {
+    match e {
+        Element::Optional(elements) | Element::Sequence(elements) | Element::Multi(elements)
+            if elements.len() == 1 =>
+        {
+            field_name_for(&elements[0])
+        }
+        Element::Terminal(terminal) => Some(term_name(terminal).to_snake_case()),
+        Element::Sequence(elements) => panic!(),
+        _ => None,
+    }
+}
+
+pub fn print_fields(p: &Element, idx: usize) {
+    match p {
+        Element::Multi(elements) => {
+            print!(
+                "    pub {}_star: ",
+                field_name_for(p).unwrap_or("multi".to_string())
+            );
+            print_type(p);
+            println!(",");
+        }
+        Element::Sequence(elements) => {
+            print_type(p);
+            println!();
+        }
+        Element::Optional(elements) => {
+            print!(
+                "    pub {}_opt: ",
+                field_name_for(p).unwrap_or("optional".to_string())
+            );
+            print_type(p);
+            println!(",");
+        }
+        Element::Terminal(terminal) if terminal.chars().next().unwrap().is_uppercase() => {
+            print!("    pub {}: ", terminal.to_snake_case());
+            print_type(p);
+            println!(",");
         }
         Element::Terminal(terminal) => {
             // Symbol
-            let name = match terminal.as_str() {
-                "{" => "left_curly_brace",
-                "}" => "right_curly_brace",
-                "[" => "left_bracket",
-                "]" => "right_bracket",
-                "(" => "left_brace",
-                ")" => "right_brace",
-                ";" => "semicolon",
-                "--" => "minus_minus",
-                "++" => "plus_plus",
-                "<<" => "shl",
-                ">>" => "shr",
-                "<<<" => "rol",
-                ">>>" => "ror",
-                "&" => "ampersand",
-                "<" => "less_than",
-                ">" => "greater_than",
-                ":" => "colon",
-                "=" => "equals_sign",
-                "==" => "equals",
-                "!=" => "not_equals",
-                "<=" => "lt_equals",
-                ">=" => "gt_equals",
-                "<<=" => "shl_assign",
-                ">>=" => "shr_assign",
-                ">>>=" => "ror_assign",
-                "<<<=" => "rol_assign",
-                "&=" => "and_assign",
-                "|=" => "or_assign",
-                "*=" => "mul_assign",
-                "/=" => "div_assign",
-                "-=" => "minus_assign",
-                "+=" => "plus_assign",
-                "%=" => "mod_assign",
-                "^=" => "neg_assign",
-                "::" => "colon_colon",
-                "!" => "not",
-                "|" => "pipe",
-                "%" => "mod",
-                "/" => "slash",
-                "~" => "tilde",
-                "." => "dot",
-                "+" => "plus",
-                "-" => "minus",
-                "*" => "star",
-                "@" => "at",
-                "<>" => "diamond",
-                "^" => "caret",
-                "?" => "question_mark",
-                "->" => "arrow_right",
-                "&&" => "logical_and",
-                "||" => "logical_or",
-                "..." => "varargs",
-                _ => panic!("{terminal}"),
-            };
-            println!("    pub {}: Span,", name);
+            let name = term_name(terminal);
+            print!("    pub {}_{idx}: ", name);
+            print_type(p);
+            println!(",");
         }
         _ => panic!("{p:?}"),
     }
@@ -267,6 +449,10 @@ fn deep_flatten<'a>(e: &'a Element, target: &mut Vec<&'a str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod out {
+        include!("../out.rs");
+    }
 
     #[test]
     fn function_name_test() {
